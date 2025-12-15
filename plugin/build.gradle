@@ -91,6 +91,8 @@ dependencies {
     implementation project(':opensearch-ml-memory')
 
     implementation group: 'software.amazon.awssdk', name: 'aws-core', version: "${versions.aws}"
+    implementation group: 'software.amazon.awssdk', name: 'sdk-core', version: "${versions.aws}"
+    implementation group: 'software.amazon.awssdk', name: 'utils', version: "${versions.aws}"
     implementation group: 'software.amazon.awssdk', name: 's3', version: "${versions.aws}"
     implementation group: 'software.amazon.awssdk', name: 'regions', version: "${versions.aws}"
 
@@ -356,6 +358,29 @@ testClusters.integTest {
                 }
             }
         }))
+    }
+
+    // Agent tracing OSIS endpoint (set via -DosisEndpoint=xxx or environment variable)
+    def osisEndpoint = System.getProperty("osisEndpoint") ?: System.getenv("OSIS_ENDPOINT") ?: ""
+    if (osisEndpoint) {
+        setting 'plugins.ml_commons.agent_tracing.osis_endpoint', osisEndpoint
+    }
+
+    // Agent tracing AWS credentials (set via system properties or environment variables)
+    def awsAccessKey = System.getProperty("awsAccessKey") ?: System.getenv("AWS_ACCESS_KEY_ID") ?: ""
+    def awsSecretKey = System.getProperty("awsSecretKey") ?: System.getenv("AWS_SECRET_ACCESS_KEY") ?: ""
+    def awsSessionToken = System.getProperty("awsSessionToken") ?: System.getenv("AWS_SESSION_TOKEN") ?: ""
+    def awsRegion = System.getProperty("awsRegion") ?: System.getenv("AWS_REGION") ?: ""
+
+    if (awsAccessKey && awsSecretKey) {
+        setting 'plugins.ml_commons.agent_tracing.aws_access_key', awsAccessKey
+        setting 'plugins.ml_commons.agent_tracing.aws_secret_key', awsSecretKey
+        if (awsSessionToken) {
+            setting 'plugins.ml_commons.agent_tracing.aws_session_token', awsSessionToken
+        }
+        if (awsRegion) {
+            setting 'plugins.ml_commons.agent_tracing.aws_region', awsRegion
+        }
     }
 
     configureClusterPlugins(delegate, jobSchedulerFile, securityPluginFile, securityEnabled)

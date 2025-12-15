@@ -59,6 +59,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Scope;
+
+import org.opensearch.ml.engine.algorithms.agent.tracing.AgentTracer;
+
 import org.apache.commons.text.StringSubstitutor;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.StepListener;
@@ -320,22 +325,41 @@ public class MLChatAgentRunner implements MLAgentRunner {
         String sessionId,
         FunctionCalling functionCalling
     ) {
-        List<Map<String, Object>> frontendTools = new ArrayList<>();
+        // Start OpenTelemetry agent span for tracing
+        String parentInteractionId = params.get(MLAgentExecutor.PARENT_INTERACTION_ID);
+        Span agentSpan = AgentTracer.startAgentSpan("ChatAgent", sessionId, parentInteractionId);
+        Scope agentScope = AgentTracer.makeCurrent(agentSpan);
+        log.info("[ChatAgent-Tracing] Created agent span: spanId={}, valid={}",
+            agentSpan.getSpanContext().getSpanId(), agentSpan.getSpanContext().isValid());
 
-        if (isAGUIAgent(params)) {
-            // Check if this is an AG-UI request with tool call results
-            String aguiToolCallResults = params.get(AGUI_PARAM_TOOL_CALL_RESULTS);
-            if (aguiToolCallResults != null && !aguiToolCallResults.isEmpty()) {
-                // Process tool call results from frontend
-                processAGUIToolResults(mlAgent, params, listener, memory, sessionId, functionCalling, aguiToolCallResults);
-                return;
+        try {
+            List<Map<String, Object>> frontendTools = new ArrayList<>();
+
+            if (isAGUIAgent(params)) {
+                log.info("[ChatAgent-Tracing] Processing AG-UI agent request");
+                // Check if this is an AG-UI request with tool call results
+                String aguiToolCallResults = params.get(AGUI_PARAM_TOOL_CALL_RESULTS);
+                if (aguiToolCallResults != null && !aguiToolCallResults.isEmpty()) {
+                    // Process tool call results from frontend
+                    log.info("[ChatAgent-Tracing] Processing AG-UI tool results, passing span to processAGUIToolResults");
+                    processAGUIToolResults(mlAgent, params, listener, memory, sessionId, functionCalling, aguiToolCallResults, agentSpan, agentScope);
+                    return;
+                }
+
+                // Parse frontend tools if present
+                String aguiTools = params.get(AGUI_PARAM_TOOLS);
+                frontendTools = parseFrontendTools(aguiTools);
             }
-
-            // Parse frontend tools if present
-            String aguiTools = params.get(AGUI_PARAM_TOOLS);
-            frontendTools = parseFrontendTools(aguiTools);
+            log.info("[ChatAgent-Tracing] Calling processUnifiedTools with span");
+            processUnifiedTools(mlAgent, params, listener, memory, sessionId, functionCalling, frontendTools, agentSpan, agentScope);
+        } catch (Exception e) {
+            log.error("[ChatAgent-Tracing] Exception in runChat, ending span with error: {}", e.getMessage(), e);
+            AgentTracer.endSpanWithError(agentSpan, e);
+            if (agentScope != null) {
+                agentScope.close();
+            }
+            throw e;
         }
-        processUnifiedTools(mlAgent, params, listener, memory, sessionId, functionCalling, frontendTools);
     }
 
     private void runReAct(
@@ -348,7 +372,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
         String tenantId,
         ActionListener<Object> listener,
         FunctionCalling functionCalling,
-        Map<String, Tool> backendTools
+        Map<String, Tool> backendTools,
+        Span agentSpan,
+        Scope agentScope
     ) {
         Map<String, String> tmpParameters = constructLLMParams(llm, parameters);
         String prompt = constructLLMPrompt(tools, tmpParameters);
@@ -373,6 +399,11 @@ public class MLChatAgentRunner implements MLAgentRunner {
         Map<String, Object> additionalInfo = new ConcurrentHashMap<>();
         Map<String, String> lastToolParams = new ConcurrentHashMap<>();
 
+        // OpenTelemetry span tracking
+        AtomicReference<Span> currentLlmSpan = new AtomicReference<>();
+        AtomicReference<Span> currentToolSpan = new AtomicReference<>();
+        AtomicInteger llmIteration = new AtomicInteger(0);
+
         StepListener firstListener = new StepListener<MLTaskResponse>();
         lastLlmListener.set(firstListener);
         StepListener<?> lastStepListener = firstListener;
@@ -392,6 +423,13 @@ public class MLChatAgentRunner implements MLAgentRunner {
             lastStepListener.whenComplete(output -> {
                 StringBuilder sessionMsgAnswerBuilder = new StringBuilder();
                 if (finalI % 2 == 0) {
+                    // End current LLM span when we receive response
+                    Span llmSpan = currentLlmSpan.get();
+                    if (llmSpan != null) {
+                        AgentTracer.endSpan(llmSpan, true, null);
+                        currentLlmSpan.set(null);
+                    }
+
                     MLTaskResponse llmResponse = (MLTaskResponse) output;
                     ModelTensorOutput tmpModelTensorOutput = (ModelTensorOutput) llmResponse.getOutput();
 
@@ -415,6 +453,13 @@ public class MLChatAgentRunner implements MLAgentRunner {
 
                     if (finalAnswer != null) {
                         finalAnswer = finalAnswer.trim();
+                        // End agent span successfully
+                        log.info("[ChatAgent-Tracing] Final answer received, ending agent span: spanId={}",
+                            agentSpan.getSpanContext().getSpanId());
+                        AgentTracer.endSpan(agentSpan, true, finalAnswer);
+                        if (agentScope != null) {
+                            agentScope.close();
+                        }
                         sendFinalAnswer(
                             sessionId,
                             listener,
@@ -497,9 +542,18 @@ public class MLChatAgentRunner implements MLAgentRunner {
 
                         if (!isBackendTool) {
                             // For frontend tool use, we close the response stream and wait for frontend tool result
+                            // End agent span here since frontend will handle tool execution
+                            // A new span will be created when frontend calls back with tool results
+                            log.info("[ChatAgent-Tracing] Frontend tool call detected (tool={}), ending agent span: spanId={}",
+                                action, agentSpan.getSpanContext().getSpanId());
+                            AgentTracer.endSpan(agentSpan, true, "frontend_tool_call:" + action);
+                            if (agentScope != null) {
+                                agentScope.close();
+                            }
                             if (streamingWrapper != null) {
                                 streamingWrapper.sendRunFinishedAndCloseStream(sessionId, parentInteractionId);
                             }
+                            return;
                         } else {
                             // Handle backend tool normally
                             Map<String, String> toolParams = constructToolParams(
@@ -518,6 +572,11 @@ public class MLChatAgentRunner implements MLAgentRunner {
                                     lastToolParams.put(key, value);
                                 }
                             });
+
+                            // Start tool span for tracing
+                            Span toolSpan = AgentTracer.startToolSpan(agentSpan, action, actionInput);
+                            currentToolSpan.set(toolSpan);
+
                             runTool(
                                 tools,
                                 toolSpecMap,
@@ -544,6 +603,13 @@ public class MLChatAgentRunner implements MLAgentRunner {
                         ((ActionListener<Object>) nextStepListener).onResponse(res);
                     }
                 } else {
+                    // End tool span when tool result is received
+                    Span toolSpan = currentToolSpan.get();
+                    if (toolSpan != null) {
+                        AgentTracer.endSpan(toolSpan, true, null);
+                        currentToolSpan.set(null);
+                    }
+
                     // output is now the processed output from POST_TOOL hook in runTool
                     Object filteredOutput = filterToolOutput(lastToolParams, output);
                     addToolOutputToAddtionalInfo(toolSpecMap, lastAction, additionalInfo, filteredOutput);
@@ -648,10 +714,32 @@ public class MLChatAgentRunner implements MLAgentRunner {
                             }
                         }
                     }
+
+                    // Start next LLM span for tracing
+                    Span nextLlmSpan = AgentTracer.startLlmSpan(agentSpan, llm.getModelId(), llmIteration.incrementAndGet());
+                    currentLlmSpan.set(nextLlmSpan);
+
                     ActionRequest request = streamingWrapper.createPredictionRequest(llm, tmpParameters, tenantId);
                     streamingWrapper.executeRequest(request, (ActionListener<MLTaskResponse>) nextStepListener);
                 }
             }, e -> {
+                // End spans on error
+                log.info("[ChatAgent-Tracing] Error in ReAct loop, ending spans with error: {}", e.getMessage());
+                Span errLlmSpan = currentLlmSpan.get();
+                if (errLlmSpan != null) {
+                    log.info("[ChatAgent-Tracing] Ending LLM span with error: spanId={}", errLlmSpan.getSpanContext().getSpanId());
+                    AgentTracer.endSpanWithError(errLlmSpan, e);
+                }
+                Span errToolSpan = currentToolSpan.get();
+                if (errToolSpan != null) {
+                    log.info("[ChatAgent-Tracing] Ending tool span with error: spanId={}", errToolSpan.getSpanContext().getSpanId());
+                    AgentTracer.endSpanWithError(errToolSpan, e);
+                }
+                log.info("[ChatAgent-Tracing] Ending agent span with error: spanId={}", agentSpan.getSpanContext().getSpanId());
+                AgentTracer.endSpanWithError(agentSpan, e);
+                if (agentScope != null) {
+                    agentScope.close();
+                }
                 AgentLoggingContext.errorWithException(log, getThreadContext(), "Failed to run chat agent", e);
                 listener.onFailure(e);
             });
@@ -680,6 +768,11 @@ public class MLChatAgentRunner implements MLAgentRunner {
                 }
             }
         }
+
+        // Start first LLM span for tracing
+        Span firstLlmSpan = AgentTracer.startLlmSpan(agentSpan, llm.getModelId(), llmIteration.incrementAndGet());
+        currentLlmSpan.set(firstLlmSpan);
+
         ActionRequest request = streamingWrapper.createPredictionRequest(llm, tmpParameters, tenantId);
         streamingWrapper.executeRequest(request, firstListener);
 
@@ -1299,7 +1392,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
         Memory memory,
         String sessionId,
         FunctionCalling functionCalling,
-        List<Map<String, Object>> frontendTools
+        List<Map<String, Object>> frontendTools,
+        Span agentSpan,
+        Scope agentScope
     ) {
         // Always get backend tools
         List<MLToolSpec> backendToolSpecs = getMlToolSpecs(mlAgent, params);
@@ -1324,7 +1419,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
                 functionCalling,
                 frontendTools,
                 backendToolsMap,
-                toolSpecMap
+                toolSpecMap,
+                agentSpan,
+                agentScope
             );
         }, e -> {
             // Even if MCP tools fail, continue with base backend tools
@@ -1342,7 +1439,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
                 functionCalling,
                 frontendTools,
                 backendToolsMap,
-                toolSpecMap
+                toolSpecMap,
+                agentSpan,
+                agentScope
             );
         }));
     }
@@ -1359,7 +1458,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
         FunctionCalling functionCalling,
         List<Map<String, Object>> frontendTools,
         Map<String, Tool> backendToolsMap,
-        Map<String, MLToolSpec> toolSpecMap
+        Map<String, MLToolSpec> toolSpecMap,
+        Span agentSpan,
+        Scope agentScope
     ) {
         // Create unified tool map by adding frontend tools as Tool objects
         Map<String, Tool> unifiedToolsMap = new HashMap<>(backendToolsMap);
@@ -1383,7 +1484,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
             mlAgent.getTenantId(),
             listener,
             functionCalling,
-            backendToolsMap
+            backendToolsMap,
+            agentSpan,
+            agentScope
         );
     }
 
@@ -1397,7 +1500,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
         Memory memory,
         String sessionId,
         FunctionCalling functionCalling,
-        String aguiToolCallResults
+        String aguiToolCallResults,
+        Span agentSpan,
+        Scope agentScope
     ) {
         try {
 
@@ -1441,7 +1546,7 @@ public class MLChatAgentRunner implements MLAgentRunner {
                     String aguiTools = params.get(AGUI_PARAM_TOOLS);
                     List<Map<String, Object>> frontendTools = parseFrontendTools(aguiTools);
 
-                    processUnifiedTools(mlAgent, updatedParams, listener, memory, sessionId, functionCalling, frontendTools);
+                    processUnifiedTools(mlAgent, updatedParams, listener, memory, sessionId, functionCalling, frontendTools, agentSpan, agentScope);
                 } else {
                     listener.onFailure(new RuntimeException("No LLM messages generated from tool results"));
                 }
